@@ -10,6 +10,7 @@ from dataclasses import dataclass, field, replace
 from os import environ
 from pathlib import Path
 from typing import Literal
+from uuid import uuid4
 
 from tau_agent.events import AgentEndEvent, AgentEvent, MessageEndEvent, ToolExecutionEndEvent
 from tau_agent.harness import AgentHarness, AgentHarnessConfig, QueuedMessages
@@ -3918,6 +3919,22 @@ class CodingSession:
             return False
         return sum(isinstance(message, UserMessage) for message in self._harness.messages) == 1
 
+    def _affinity_session_id(self) -> str:
+        """Stable per-session id for provider affinity headers.
+
+        OpenCode Go (tau commit 7868ec7) sends ``x-opencode-session`` and
+        rejects requests that omit it; naming/compaction requests must carry a
+        session id too. Sessions without a record id (in-memory children,
+        e.g. spawned by the tau-subagents extension) get a stable fallback id
+        instead of None so the header is always emitted.
+        """
+        if self._config.session_id is not None:
+            return self._config.session_id
+        fallback = getattr(self, "_affinity_session_fallback_id", None)
+        if fallback is None:
+            fallback = self._affinity_session_fallback_id = f"mem-{uuid4().hex}"
+        return fallback
+
     async def _generate_session_name(self, first_message: str) -> str | None:
         prompt = (
             "Create a concise session name for this first user message. "
@@ -3931,6 +3948,7 @@ class CodingSession:
             system=SESSION_NAME_SYSTEM_PROMPT,
             messages=[UserMessage(content=prompt)],
             tools=[],
+            session_id=self._affinity_session_id(),
         ):
             if isinstance(event, TextDeltaEvent):
                 text_parts.append(event.delta)
@@ -4001,6 +4019,7 @@ class CodingSession:
             system=SUMMARIZATION_SYSTEM_PROMPT,
             messages=summary_messages,
             tools=[],
+            session_id=self._affinity_session_id(),
         ):
             if isinstance(event, TextDeltaEvent):
                 text_parts.append(event.delta)
