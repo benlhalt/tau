@@ -1,7 +1,8 @@
 import asyncio
 import json
+import ssl
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from io import BytesIO
 from pathlib import Path
 
@@ -5004,6 +5005,218 @@ async def test_session_compacts_and_retries_once_after_context_overflow(
     assert extension_event_types[-2:] == ["auto_retry_end", "agent_settled"]
     assert extension_event_types.count("agent_settled") == 1
     assert sum(isinstance(event, AgentSettledEvent) for event in retry_events) == 1
+
+
+class _TransientRaisingFakeProvider(FakeProvider):
+    """A FakeProvider that raises a scripted exception for its first N calls."""
+
+    def __init__(
+        self,
+        streams: Iterable[Iterable[AssistantMessageEvent]],
+        *,
+        failures: int,
+        exc: BaseException,
+    ) -> None:
+        super().__init__(streams)
+        self._failures = failures
+        self._exc = exc
+
+    def stream_response(
+        self,
+        *,
+        model: str,
+        system: str,
+        messages: list[AgentMessage],
+        tools: list[AgentTool],
+        signal: CancellationToken | None = None,
+        session_id: str | None = None,
+    ) -> AsyncIterator[AssistantMessageEvent]:
+        self.calls.append((model, system, list(messages), list(tools)))
+        self.session_ids.append(session_id)
+        if self._failures > 0:
+            self._failures -= 1
+            raise self._exc
+        stream = self._streams.pop(0) if self._streams else []
+
+        async def iterator() -> AsyncIterator[AssistantMessageEvent]:
+            for event in stream:
+                if signal is not None and signal.is_cancelled():
+                    return
+                yield event
+
+        return iterator()
+
+
+@pytest.mark.anyio
+async def test_transient_ssl_exception_auto_retries_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(coding_session_module, "_TRANSIENT_RETRY_BASE_DELAY_MS", 0)
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = _TransientRaisingFakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Recovered answer")),
+            ]
+        ],
+        failures=1,
+        exc=ssl.SSLError("ssl/tls alert bad record mac"),
+    )
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+
+    events = await _collect_session_events(session.prompt("hello"))
+    event_types = [getattr(event, "type", None) for event in events]
+    assert "auto_retry_start" in event_types
+    retry_end = next(event for event in events if getattr(event, "type", None) == "auto_retry_end")
+    assert retry_end.success is True
+    assert retry_end.final_error is None
+    assert any(
+        getattr(event, "type", None) == "message_end"
+        and getattr(getattr(event, "message", None), "text", None) == "Recovered answer"
+        for event in events
+    )
+    # Exactly one re-run after the failing request, and nothing was committed
+    # between the two attempts: the replay context is identical.
+    assert len(provider.calls) == 2
+    assert provider.calls[0][0] == provider.calls[1][0]
+    assert provider.calls[0][2] == provider.calls[1][2]
+    assert "agent_settled" in event_types
+
+
+@pytest.mark.anyio
+async def test_transient_exception_auto_retry_exhausts_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(coding_session_module, "_TRANSIENT_RETRY_BASE_DELAY_MS", 0)
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = _TransientRaisingFakeProvider(
+        [],
+        failures=10,
+        exc=ssl.SSLError("persistent bad record mac"),
+    )
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+
+    raised: BaseException | None = None
+    collected: list[object] = []
+    try:
+        async for event in session.prompt("hello"):
+            collected.append(event)
+    except ssl.SSLError as exc:
+        raised = exc
+    assert isinstance(raised, ssl.SSLError)
+    event_types = [getattr(event, "type", None) for event in collected]
+    # The failed request plus exactly two auto-retries before giving up.
+    assert event_types.count("auto_retry_start") == 2
+    retry_end = next(
+        event for event in collected if getattr(event, "type", None) == "auto_retry_end"
+    )
+    assert retry_end.success is False
+    assert "bad record" in (retry_end.final_error or "")
+    assert len(provider.calls) == 3
+
+
+@pytest.mark.anyio
+async def test_transient_exception_auto_retry_skips_non_transport_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(coding_session_module, "_TRANSIENT_RETRY_BASE_DELAY_MS", 0)
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = _TransientRaisingFakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Unused")),
+            ]
+        ],
+        failures=1,
+        exc=ValueError("boom"),
+    )
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+
+    raised: BaseException | None = None
+    collected: list[object] = []
+    try:
+        async for event in session.prompt("hello"):
+            collected.append(event)
+    except ValueError as exc:
+        raised = exc
+    assert isinstance(raised, ValueError)
+    assert not any(getattr(event, "type", None) == "auto_retry_start" for event in collected)
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.anyio
+async def test_transient_exception_auto_retry_skips_cert_verification(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(coding_session_module, "_TRANSIENT_RETRY_BASE_DELAY_MS", 0)
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = _TransientRaisingFakeProvider(
+        [],
+        failures=1,
+        exc=ssl.SSLCertVerificationError("certificate verify failed: self-signed"),
+    )
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+
+    raised: BaseException | None = None
+    collected: list[object] = []
+    try:
+        async for event in session.prompt("hello"):
+            collected.append(event)
+    except ssl.SSLCertVerificationError as exc:
+        raised = exc
+    assert isinstance(raised, ssl.SSLCertVerificationError)
+    assert not any(getattr(event, "type", None) == "auto_retry_start" for event in collected)
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.anyio
+async def test_transient_exception_auto_retry_aborts_on_cancel_during_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(coding_session_module, "_TRANSIENT_RETRY_BASE_DELAY_MS", 500)
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = _TransientRaisingFakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Recovered answer")),
+            ]
+        ],
+        failures=1,
+        exc=ssl.SSLError("ssl/tls alert bad record mac"),
+    )
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+
+    agen = session.prompt("hello")
+    collected: list[object] = []
+    async for event in agen:
+        collected.append(event)
+        if getattr(event, "type", None) == "auto_retry_start":
+            break
+    session.cancel()
+    collected.extend([event async for event in agen])  # type: ignore[attr-defined]
+
+    event_types = [getattr(event, "type", None) for event in collected]
+    retry_end = next(
+        event for event in collected if getattr(event, "type", None) == "auto_retry_end"
+    )
+    assert retry_end.success is False
+    assert retry_end.final_error == "Cancelled during retry backoff"
+    # Cancelling during backoff must not fire the retried request.
+    assert len(provider.calls) == 1
+    assert "agent_settled" in event_types
+    assert not any(
+        getattr(event, "type", None) == "message_end"
+        and getattr(getattr(event, "message", None), "text", None) == "Recovered answer"
+        for event in collected
+    )
 
 
 @pytest.mark.anyio

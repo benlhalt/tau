@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ssl
 import string
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import suppress
@@ -12,8 +13,15 @@ from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
+import httpx
+
 from tau_agent.events import AgentEndEvent, AgentEvent, MessageEndEvent, ToolExecutionEndEvent
-from tau_agent.harness import AgentHarness, AgentHarnessConfig, QueuedMessages
+from tau_agent.harness import (
+    AgentHarness,
+    AgentHarnessConfig,
+    QueuedMessages,
+    SimpleCancellationToken,
+)
 from tau_agent.messages import (
     AgentMessage,
     AssistantMessage,
@@ -47,6 +55,7 @@ from tau_agent.tools import AgentTool
 from tau_agent.types import JSONValue
 from tau_ai.model_catalog import ModelCatalogProvider, RuntimeModel, RuntimeModelCatalog
 from tau_ai.model_limits import ModelLimitsProvider, RuntimeModelLimits
+from tau_ai.retry import wait_for_retry
 from tau_coding.branch_summary import summarize_branch_messages_with_model
 from tau_coding.codex_model_store import (
     cached_codex_model_catalog,
@@ -494,6 +503,10 @@ class CodingSession:
         self._persisted_message_ids: set[int] = set()
         self._ended_message_ids: set[int] = set()
         self._pending_message_writes: dict[int, _PendingMessageWrite] = {}
+        # Cancellable token for transient-error retry backoff between runs. The
+        # harness's token only exists while a run is active, so escape/backoff
+        # needs its own token that CodingSession.cancel() cancels too.
+        self._retry_interrupt = SimpleCancellationToken()
         self._attach_persistence_listener()
 
     @classmethod
@@ -1533,6 +1546,7 @@ class CodingSession:
     def cancel(self) -> None:
         """Cancel the currently running agent turn, if any."""
         self._harness.cancel()
+        self._retry_interrupt.cancel()
 
     def queue_update_event(self) -> QueueUpdateEvent:
         """Return the current queue state as a coding-session event."""
@@ -2315,6 +2329,106 @@ class CodingSession:
         )
         await self._extension_runtime.emit_event(retry_end)
         yield retry_end
+
+    async def _run_transient_exception_auto_retry(
+        self,
+        *,
+        context: AgentCallDiagnosticContext,
+        exc: BaseException,
+        phase: str,
+    ) -> AsyncIterator[CodingSessionEvent]:
+        """Auto-retry one escaped transient transport failure like a "continue".
+
+        A transport exception (SSL drop, connection reset, timeout) escaping the
+        provider stream commits nothing to the transcript — ``run_agent_loop``
+        appends an assistant message only after its stream completes — so
+        re-running the harness loop re-prompts exactly the clean context a human
+        "continue" would use, over a fresh connection.
+
+        Retrying is bounded (``_TRANSIENT_RETRY_MAX_ATTEMPTS`` total requests)
+        and cancellable during backoff. Non-transient exceptions are re-raised
+        immediately through the caller's unchanged log-and-raise behavior keep
+        ``kind == "exception"`` meaning "the run died". A cancelled backoff
+        ends the cycle gracefully (no re-raise).
+        """
+        if not _is_transient_transport_exception(exc):
+            self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
+                context=context,
+                phase=phase,
+                exc=exc,
+            )
+            raise exc
+
+        max_attempts = _TRANSIENT_RETRY_MAX_ATTEMPTS
+        attempts_used = 0
+        current_exc = exc
+        seen_errors: list[tuple[str, str]] = [(_exception_class_name(exc), str(exc))]
+        cancelled = False
+        success = False
+        while attempts_used < max_attempts - 1:
+            attempts_used += 1
+            delay_ms = _transient_retry_delay_ms(attempts_used)
+            retry_start = AutoRetryStartEvent(
+                attempt=attempts_used,
+                max_attempts=max_attempts,
+                delay_ms=delay_ms,
+                error_message=str(current_exc),
+            )
+            await self._extension_runtime.emit_event(retry_start)
+            yield retry_start
+            if not await wait_for_retry(delay_ms / 1000, signal=self._retry_interrupt):
+                cancelled = True
+                break
+            retry_events = self._harness.continue_()
+            self._invalidate_context_usage_cache()
+            try:
+                async for retry_event in retry_events:
+                    if isinstance(retry_event, ToolExecutionEndEvent):
+                        self._invalidate_context_usage_cache()
+                    if isinstance(retry_event, AgentEndEvent):
+                        yield SessionAgentEndEvent(
+                            messages=retry_event.messages,
+                            will_retry=False,
+                        )
+                    else:
+                        yield retry_event
+                success = True
+                break
+            except Exception as nested_exc:
+                aclose = getattr(retry_events, "aclose", None)
+                if aclose is not None:
+                    with suppress(Exception):
+                        await aclose()
+                current_exc = nested_exc
+                seen_errors.append((_exception_class_name(nested_exc), str(nested_exc)))
+                if not _is_transient_transport_exception(nested_exc):
+                    break
+        final_error = (
+            None
+            if success
+            else ("Cancelled during retry backoff" if cancelled else str(current_exc))
+        )
+        retry_end = AutoRetryEndEvent(
+            success=success,
+            attempt=attempts_used,
+            final_error=final_error,
+        )
+        await self._extension_runtime.emit_event(retry_end)
+        yield retry_end
+        self._last_diagnostic_log_path = self._diagnostic_logger.log_transient_auto_retry(
+            context=context,
+            success=success,
+            attempts=attempts_used,
+            max_attempts=max_attempts,
+            errors=seen_errors,
+        )
+        if not success and not cancelled:
+            self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
+                context=context,
+                phase=phase,
+                exc=current_exc,
+            )
+            raise current_exc
 
     def _build_runtime_provider(
         self,
@@ -3363,6 +3477,9 @@ class CodingSession:
         # id() values can be reused once earlier message objects are freed.
         self._ended_message_ids.clear()
         self._persisted_message_ids.clear()
+        # A new user run starts with a fresh cancellation token so a prior
+        # cancel cannot abort this run's transient-error retry backoff.
+        self._retry_interrupt = SimpleCancellationToken()
         events: AsyncIterator[AgentEvent] | None = None
         settled_event: AgentSettledEvent | None = None
         overflow_message: AssistantMessage | None = None
@@ -3478,12 +3595,12 @@ class CodingSession:
             else:
                 await self._try_auto_compact(context=context, phase="auto_compact_after_prompt")
         except Exception as exc:
-            self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
+            async for auto_retry_event in self._run_transient_exception_auto_retry(
                 context=context,
-                phase="agent_loop",
                 exc=exc,
-            )
-            raise
+                phase="agent_loop",
+            ):
+                yield auto_retry_event
         finally:
             try:
                 await self._reconcile_run_persistence(events, context=context)
@@ -3501,6 +3618,9 @@ class CodingSession:
         # id() values can be reused once earlier message objects are freed.
         self._ended_message_ids.clear()
         self._persisted_message_ids.clear()
+        # A new user run starts with a fresh cancellation token so a prior
+        # cancel cannot abort this run's transient-error retry backoff.
+        self._retry_interrupt = SimpleCancellationToken()
         events: AsyncIterator[AgentEvent] | None = None
         settled_event: AgentSettledEvent | None = None
         route_failure_message: AssistantMessage | None = None
@@ -3534,12 +3654,12 @@ class CodingSession:
                     yield failover_event
             await self._try_auto_compact(context=context, phase="auto_compact_after_continue")
         except Exception as exc:
-            self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
+            async for auto_retry_event in self._run_transient_exception_auto_retry(
                 context=context,
-                phase="agent_loop",
                 exc=exc,
-            )
-            raise
+                phase="agent_loop",
+            ):
+                yield auto_retry_event
         finally:
             try:
                 await self._reconcile_run_persistence(events, context=context)
@@ -4326,6 +4446,45 @@ def is_retryable_huggingface_route_error(message: AssistantMessage) -> bool:
         if isinstance(status_code, int) and not isinstance(status_code, bool):
             return status_code in {408, 409, 425, 429} or status_code >= 500
     return False
+
+
+# Transient-exception auto-retry: total request attempts (the failed request
+# plus two retries) and capped exponential backoff in milliseconds. The backoff
+# is longer than the adapter-level ~1s window so a slow transient blip (e.g. an
+# SSL drop that a human "continue" clears) can recover before the turn dies.
+_TRANSIENT_RETRY_MAX_ATTEMPTS = 3
+_TRANSIENT_RETRY_BASE_DELAY_MS = 2_000
+_TRANSIENT_RETRY_MAX_DELAY_MS = 16_000
+
+
+def _transient_retry_delay_ms(attempt: int) -> int:
+    """Return capped exponential backoff in milliseconds for one retry."""
+    return int(
+        min(_TRANSIENT_RETRY_MAX_DELAY_MS, _TRANSIENT_RETRY_BASE_DELAY_MS * (2 ** (attempt - 1)))
+    )
+
+
+def _exception_class_name(exc: BaseException) -> str:
+    """Return a stable, JSON-safe exception type name."""
+    return f"{type(exc).__module__}.{type(exc).__name__}"
+
+
+def _is_transient_transport_exception(exc: BaseException) -> bool:
+    """Return whether an escaped exception is a transient transport failure.
+
+    Order matters: ``SSLCertVerificationError`` is a persistent trust problem
+    and subclasses ``SSLError``, so it must be excluded before the SSLError
+    branch. ``SSLEOFError`` subclasses ``SSLError``; ``socket.timeout`` is an
+    alias of ``TimeoutError``; httpx transport errors can leak from streaming
+    reads in some versions and are transient by the same rule.
+    """
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return False
+    if isinstance(exc, ssl.SSLError):
+        return True
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
+    return bool(isinstance(exc, httpx.TransportError))
 
 
 def _session_entry_for_message(
