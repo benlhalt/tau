@@ -175,6 +175,8 @@ SESSION_NAME_SYSTEM_PROMPT = (
     "You write concise coding-agent session names. Reply with only a short title, "
     "maximum four words, no quotes, no punctuation-only output."
 )
+_AUTO_NAME_REGEN_PROMPT_COUNTS: tuple[int, ...] = (5, 10)
+
 TREE_RUNNING_MESSAGE = "Tau is still working. Press Escape to interrupt before using /tree."
 
 
@@ -2860,12 +2862,18 @@ class CodingSession:
         return f"Resumed session: {record.id}"
 
     async def set_session_name(self, name: str) -> str:
-        """Persist a session name and notify extensions after it changes."""
+        """Persist a session name and notify extensions after it changes.
+
+        A manual rename clears the auto-generated title provenance, which
+        permanently disables future automatic regeneration for this session.
+        """
         normalized = normalize_session_name(name)
         persisted = self._persist_session_name(
             normalized,
             only_if_unnamed=False,
+            only_if_auto=False,
             index_if_missing=True,
+            provenance="manual",
         )
         if persisted is None:
             return normalized
@@ -2878,8 +2886,18 @@ class CodingSession:
         *,
         only_if_unnamed: bool,
         index_if_missing: bool,
+        only_if_auto: bool = False,
+        provenance: Literal["auto", "manual"] | None = None,
+        regen_stage: int | None = None,
     ) -> str | None:
-        """Persist and return a changed name; return None for a no-op."""
+        """Persist and return a changed name; return None for a no-op.
+
+        ``only_if_auto`` no-ops when the record's title was not produced by an
+        auto-naming run (closing the race where a manual rename lands while a
+        regeneration request is in flight). ``provenance`` records whether the
+        title is auto-generated (``auto``) or user-owned (``manual``) on the
+        index record; ``manual`` clears auto provenance for good.
+        """
         normalized = normalize_session_name(name)
         manager = self._config.session_manager
         session_id = self._config.session_id
@@ -2893,13 +2911,26 @@ class CodingSession:
             return None
         if only_if_unnamed and record.title:
             return None
+        if only_if_auto and (record.auto_title is None or record.title != record.auto_title):
+            return None
         if record.title == normalized:
             return None
+        if provenance == "auto":
+            auto_title = normalized
+            auto_name_stage = regen_stage if regen_stage else record.auto_name_stage
+        elif provenance == "manual":
+            auto_title = None
+            auto_name_stage = record.auto_name_stage
+        else:
+            auto_title = record.auto_title
+            auto_name_stage = record.auto_name_stage
         updated = manager.touch_session(
             session_id,
             model=self.model,
             provider_name=self.provider_name,
             title=normalized,
+            auto_title=auto_title,
+            auto_name_stage=auto_name_stage,
         )
         if updated is None:
             if index_if_missing:
@@ -3334,7 +3365,6 @@ class CodingSession:
         self._persisted_message_ids.clear()
         events: AsyncIterator[AgentEvent] | None = None
         settled_event: AgentSettledEvent | None = None
-        auto_name_attempted = False
         overflow_message: AssistantMessage | None = None
         route_failure_message: AssistantMessage | None = None
         try:
@@ -3352,12 +3382,7 @@ class CodingSession:
             self._invalidate_context_usage_cache()
             async for event in events:
                 auto_name_message: str | None = None
-                if (
-                    isinstance(event, MessageEndEvent)
-                    and not auto_name_attempted
-                    and isinstance(event.message, UserMessage)
-                ):
-                    auto_name_attempted = True
+                if isinstance(event, MessageEndEvent) and isinstance(event.message, UserMessage):
                     auto_name_message = event.message.text
                 if isinstance(event, ToolExecutionEndEvent):
                     self._invalidate_context_usage_cache()
@@ -3884,40 +3909,95 @@ class CodingSession:
 
     async def _try_auto_name_session(
         self,
-        first_message: str,
+        latest_user_message: str,
         *,
         context: AgentCallDiagnosticContext,
     ) -> None:
-        if not self._should_auto_name_session():
+        stage = self._auto_name_stage()
+        if stage is None:
             return
+        if stage == 0:
+            source_text = latest_user_message
+            source_kind: Literal["first_message", "conversation"] = "first_message"
+        else:
+            source_text = self._conversation_naming_digest()
+            source_kind = "conversation"
         try:
-            title = await self._generate_session_name(first_message)
+            title = await self._generate_session_name(source_text, source_kind=source_kind)
         except Exception as exc:  # noqa: BLE001 - naming must not interrupt the agent turn
             self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
                 context=context,
                 phase="auto_name_session",
                 exc=exc,
             )
-            title = _fallback_session_name(first_message)
+            title = None
+        if title is None and stage == 0:
+            title = _fallback_session_name(latest_user_message)
         if title is None:
-            title = _fallback_session_name(first_message)
-        if title is None:
+            # A failed regeneration keeps the existing title. Mark the stage
+            # attempted so a broken naming provider cannot levy a doomed
+            # request on every subsequent prompt.
+            if stage > 0:
+                self._mark_auto_name_stage(stage)
             return
         persisted = self._persist_session_name(
             title,
-            only_if_unnamed=True,
+            only_if_unnamed=(stage == 0),
+            only_if_auto=(stage > 0),
             index_if_missing=False,
+            provenance="auto",
+            regen_stage=stage,
         )
         if persisted is not None:
             await self._extension_runtime.emit_event(SessionInfoChangedEvent(name=persisted))
 
-    def _should_auto_name_session(self) -> bool:
-        if self._config.session_id is None or self._config.session_manager is None:
-            return False
-        record = self._config.session_manager.get_session(self._config.session_id)
-        if record is not None and record.title:
-            return False
-        return sum(isinstance(message, UserMessage) for message in self._harness.messages) == 1
+    def _mark_auto_name_stage(self, stage: int) -> None:
+        """Best-effort durable record that a regeneration stage was attempted."""
+        manager = self._config.session_manager
+        session_id = self._config.session_id
+        if manager is None or session_id is None:
+            return
+        with suppress(Exception):
+            manager.touch_session(session_id, auto_name_stage=stage)
+
+    def _user_prompt_count(self) -> int:
+        """Count durable user prompts on the active branch path.
+
+        Counts from the append-only entries rather than the in-memory context
+        view so it survives compaction (which rewrites only the live context)
+        and is correct for sessions resumed from disk.
+        """
+        return sum(
+            1
+            for entry in self._state.entries
+            if entry.type == "message" and isinstance(entry.message, UserMessage)
+        )
+
+    def _auto_name_stage(self) -> int | None:
+        """Resolve the naming stage for the current prompt count.
+
+        ``0`` means initial naming from the first user message (the historical
+        behavior); ``1..N`` mean regeneration stages keyed to
+        ``_AUTO_NAME_REGEN_PROMPT_COUNTS``; ``None`` means do not name now.
+        Regeneration only applies to titles Tau produced itself: a manual
+        rename (``auto_title`` cleared) permanently opts the session out.
+        """
+        manager = self._config.session_manager
+        session_id = self._config.session_id
+        if manager is None or session_id is None:
+            return None
+        record = manager.get_session(session_id)
+        count = self._user_prompt_count()
+        if count == 1 and (record is None or not record.title):
+            return 0
+        if record is None or not record.title:
+            return None
+        if record.auto_title is None or record.title != record.auto_title:
+            return None
+        for stage, threshold in enumerate(_AUTO_NAME_REGEN_PROMPT_COUNTS, start=1):
+            if count >= threshold and record.auto_name_stage < stage:
+                return stage
+        return None
 
     def _affinity_session_id(self) -> str:
         """Stable per-session id for provider affinity headers.
@@ -3935,12 +4015,24 @@ class CodingSession:
             fallback = self._affinity_session_fallback_id = f"mem-{uuid4().hex}"
         return fallback
 
-    async def _generate_session_name(self, first_message: str) -> str | None:
-        prompt = (
-            "Create a concise session name for this first user message. "
-            "Use at most four words.\n\n"
-            f"User message:\n{first_message}"
-        )
+    async def _generate_session_name(
+        self,
+        source_text: str,
+        *,
+        source_kind: Literal["first_message", "conversation"],
+    ) -> str | None:
+        if source_kind == "first_message":
+            prompt = (
+                "Create a concise session name for this first user message. "
+                "Use at most four words.\n\n"
+                f"User message:\n{source_text}"
+            )
+        else:
+            prompt = (
+                "Create a concise session name for this conversation. "
+                "Use at most four words.\n\n"
+                f"Conversation so far:\n{source_text}"
+            )
         text_parts: list[str] = []
         final_text: str | None = None
         async for event in self._harness.config.provider.stream_response(
@@ -3959,6 +4051,28 @@ class CodingSession:
                     f"Session naming failed: {event.error.error_message or event.reason}"
                 )
         return _sanitize_session_name(final_text if final_text is not None else "".join(text_parts))
+
+    def _conversation_naming_digest(self, *, max_chars: int = 6000) -> str:
+        """Build a compact role-labeled digest of the live conversation.
+
+        Uses the post-compaction in-memory context so a compacted session
+        names itself from the summary plus recent turns.
+        """
+        lines: list[str] = []
+        for message in self._harness.messages:
+            if isinstance(message, UserMessage):
+                role, text = "User", message.text
+            elif isinstance(message, AssistantMessage):
+                role, text = "Assistant", message.text
+            else:
+                continue
+            text = " ".join(text.split())
+            if text:
+                lines.append(f"{role}: {text}")
+        digest = "\n".join(lines)
+        if len(digest) <= max_chars:
+            return digest
+        return "…\n" + digest[-max_chars:]
 
     def _provider_is_usable(self, provider: ProviderConfig) -> bool:
         return provider_has_usable_credentials(

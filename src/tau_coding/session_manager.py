@@ -7,7 +7,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from time import time
-from typing import Literal
+from typing import Final, Literal, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict
@@ -22,6 +22,8 @@ _WINDOWS_RESERVED_FILE_STEMS = frozenset(
     | {f"lpt{index}" for index in range(1, 10)}
 )
 _SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
+
+_UNSET_AUTO_TITLE: Final[object] = object()
 
 InferenceProviderMode = Literal["automatic", "fixed"]
 
@@ -67,6 +69,8 @@ class SessionRecordModel(BaseModel):
     title: str | None = None
     created_at: float
     updated_at: float
+    auto_title: str | None = None
+    auto_name_stage: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +87,8 @@ class CodingSessionRecord:
     provider_name: str | None = None
     inference_provider: str | None = None
     inference_provider_mode: InferenceProviderMode = "automatic"
+    auto_title: str | None = None
+    auto_name_stage: int = 0
 
     @classmethod
     def from_model(cls, model: SessionRecordModel) -> CodingSessionRecord:
@@ -101,6 +107,8 @@ class CodingSessionRecord:
                 model.inference_provider_mode
                 or ("fixed" if model.inference_provider is not None else "automatic")
             ),
+            auto_title=model.auto_title,
+            auto_name_stage=model.auto_name_stage,
         )
 
     def to_model(self) -> SessionRecordModel:
@@ -116,6 +124,8 @@ class CodingSessionRecord:
             provider_name=self.provider_name,
             inference_provider=self.inference_provider,
             inference_provider_mode=self.inference_provider_mode,
+            auto_title=self.auto_title,
+            auto_name_stage=self.auto_name_stage,
         )
 
 
@@ -380,11 +390,24 @@ class SessionManager:
         inference_provider_mode: InferenceProviderMode | None = None,
         preserve_inference_provider: bool = True,
         title: str | None = None,
+        auto_title: str | None | object = _UNSET_AUTO_TITLE,
+        auto_name_stage: int | None = None,
     ) -> CodingSessionRecord | None:
-        """Update a session's last-used metadata."""
+        """Update a session's last-used metadata.
+
+        ``auto_title`` uses a sentinel default so callers can preserve it
+        (omit), clear it (``None``), or set it (``str``); ``auto_name_stage``
+        uses ``None`` to preserve and an integer to set.
+        """
         existing = self.get_session(session_id)
         if existing is None:
             return None
+        resolved_auto_title = (
+            existing.auto_title if auto_title is _UNSET_AUTO_TITLE else cast(str | None, auto_title)
+        )
+        resolved_auto_name_stage = (
+            existing.auto_name_stage if auto_name_stage is None else auto_name_stage
+        )
         updated = CodingSessionRecord(
             id=existing.id,
             path=existing.path,
@@ -402,6 +425,8 @@ class SessionManager:
             title=title if title is not None else existing.title,
             created_at=existing.created_at,
             updated_at=time(),
+            auto_title=resolved_auto_title,
+            auto_name_stage=resolved_auto_name_stage,
         )
         self._upsert(updated)
         return updated

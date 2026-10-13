@@ -362,3 +362,85 @@ def test_session_manager_sorts_newest_updated_first(tmp_path: Path) -> None:
 
     assert [session.id for session in sessions] == ["older", "newer"]
     assert newer in sessions
+
+
+def test_session_manager_persists_auto_title_provenance(tmp_path: Path) -> None:
+    manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    record = manager.create_session(cwd=cwd, model="fake")
+
+    updated = manager.touch_session(
+        record.id,
+        title="Fix CLI output",
+        auto_title="Fix CLI output",
+        auto_name_stage=1,
+    )
+
+    assert updated is not None
+    assert updated.auto_title == "Fix CLI output"
+    assert updated.auto_name_stage == 1
+    reloaded = manager.get_session(record.id)
+    assert reloaded is not None
+    assert reloaded.auto_title == "Fix CLI output"
+    assert reloaded.auto_name_stage == 1
+
+
+def test_session_manager_touch_preserves_provenance_by_default(tmp_path: Path) -> None:
+    manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    record = manager.create_session(cwd=cwd, model="fake")
+    manager.touch_session(record.id, title="Auto", auto_title="Auto", auto_name_stage=1)
+
+    updated = manager.touch_session(record.id, title="Auto", model="new-model")
+
+    assert updated is not None
+    assert updated.auto_title == "Auto"
+    assert updated.auto_name_stage == 1
+
+
+def test_session_manager_touch_clears_and_never_mutates_auto_title(tmp_path: Path) -> None:
+    manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    record = manager.create_session(cwd=cwd, model="fake")
+    manager.touch_session(record.id, title="Auto", auto_title="Auto", auto_name_stage=2)
+
+    cleared = manager.touch_session(record.id, title="Manual", auto_title=None)
+
+    assert cleared is not None
+    assert cleared.auto_title is None
+    assert cleared.auto_name_stage == 2
+    untouched = manager.touch_session(cleared.id, title="Manual", auto_name_stage=1)
+    assert untouched is not None
+    assert untouched.auto_title is None
+
+
+def test_session_manager_loads_legacy_records_without_provenance(tmp_path: Path) -> None:
+    manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    index_path = manager.project_index_path(cwd)
+    index_path.parent.mkdir(parents=True)
+    index_path.write_text(
+        json.dumps(
+            {
+                "id": "legacy-session",
+                "path": str(index_path.parent / "legacy-session.jsonl"),
+                "cwd": str(cwd.resolve()),
+                "model": "gpt-5",
+                "title": "Existing",
+                "created_at": 1.0,
+                "updated_at": 2.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    [record] = manager.list_sessions(cwd)
+
+    assert record.title == "Existing"
+    assert record.auto_title is None
+    assert record.auto_name_stage == 0

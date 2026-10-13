@@ -3057,6 +3057,379 @@ async def test_session_auto_name_does_not_index_new_session_before_first_persist
     assert await storage.read_all() == []
 
 
+async def _drive_prompts(session: CodingSession, *messages: str) -> None:
+    for message in messages:
+        await _collect_session_events(session.prompt(message))
+
+
+@pytest.mark.anyio
+async def test_session_auto_name_regenerates_after_fifth_prompt(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
+    record = manager.create_session(cwd=tmp_path, model="fake")
+    provider = FakeProvider(
+        [
+            # Prompt 1: auto-name then agent.
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Fix broken CLI output")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 1")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 2")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 3")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 4")),
+            ],
+            # Prompt 5: regeneration then agent.
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Broken API parser five")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 5")),
+            ],
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            session_id=record.id,
+            session_manager=manager,
+        )
+    )
+
+    await _drive_prompts(
+        session,
+        "Fix the broken CLI output.",
+        "Add a parser module.",
+        "Wire the unit tests.",
+        "Update the README docs.",
+        "Handle timeout errors.",
+    )
+
+    renamed = manager.get_session(record.id)
+    assert renamed is not None
+    assert renamed.title == "Broken API parser five"
+    assert renamed.auto_title == "Broken API parser five"
+    assert renamed.auto_name_stage == 1
+    assert len(provider.calls) == 7
+    # The initial call names from the first message only.
+    assert "first user message" in provider.calls[0][2][0].content
+    # The regeneration call at the 5th prompt names from the conversation digest.
+    regen_prompt = provider.calls[5][2][0].content
+    assert "conversation" in regen_prompt
+    assert "User: Fix the broken CLI output." in regen_prompt
+    assert "User: Update the README docs." in regen_prompt
+
+
+@pytest.mark.anyio
+async def test_session_auto_name_regenerates_after_tenth_prompt(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
+    record = manager.create_session(cwd=tmp_path, model="fake")
+    streams: list[list[object]] = [
+        [
+            assistant_start(model="fake"),
+            assistant_done(message=AssistantMessage(content="Initial title")),
+        ],
+    ]
+    for index in range(1, 5):
+        streams.append(
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content=f"Done {index}")),
+            ]
+        )
+    streams.append(
+        [
+            assistant_start(model="fake"),
+            assistant_done(message=AssistantMessage(content="Fifth title here")),
+        ]
+    )
+    for index in range(5, 10):
+        streams.append(
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content=f"Done {index}")),
+            ]
+        )
+    # A long stage-2 title verifies the 4-word cap still applies to regenerated names.
+    streams.append(
+        [
+            assistant_start(model="fake"),
+            assistant_done(
+                message=AssistantMessage(content="Tenth title beyond the word limit here")
+            ),
+        ]
+    )
+    streams.append(
+        [
+            assistant_start(model="fake"),
+            assistant_done(message=AssistantMessage(content="Done 10")),
+        ]
+    )
+    provider = FakeProvider(streams)
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            session_id=record.id,
+            session_manager=manager,
+        )
+    )
+
+    await _drive_prompts(
+        session,
+        "Prompt one.",
+        "Prompt two.",
+        "Prompt three.",
+        "Prompt four.",
+        "Prompt five.",
+        "Prompt six.",
+        "Prompt seven.",
+        "Prompt eight.",
+        "Prompt nine.",
+        "Prompt ten.",
+    )
+
+    renamed = manager.get_session(record.id)
+    assert renamed is not None
+    assert renamed.title == "Tenth title beyond the"
+    assert renamed.auto_title == "Tenth title beyond the"
+    assert renamed.auto_name_stage == 2
+    assert len(provider.calls) == 13
+    # Exactly three naming requests: prompts 1, 5, and 10.
+    naming_prompts = [call[2][0].content for call in provider.calls if call[3] == []]
+    assert len(naming_prompts) == 3
+
+
+@pytest.mark.anyio
+async def test_session_auto_name_regen_preserves_manual_name(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
+    record = manager.create_session(cwd=tmp_path, model="fake")
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Fix broken CLI output")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 1")),
+            ],
+        ]
+        + [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content=f"Done {index}")),
+            ]
+            for index in range(2, 8)
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            session_id=record.id,
+            session_manager=manager,
+        )
+    )
+
+    await _drive_prompts(session, "Fix the broken CLI output.", "Add a parser module.")
+    assert manager.get_session(record.id) is not None
+    assert manager.get_session(record.id).title == "Fix broken CLI output"
+
+    await session.set_session_name("Manual name")
+
+    # Drive past the 5th prompt: regeneration must stay disabled.
+    await _drive_prompts(
+        session,
+        "Wire the unit tests.",
+        "Update the README docs.",
+        "Handle timeout errors.",
+        "Refactor the internals.",
+        "Bump the version.",
+    )
+
+    updated = manager.get_session(record.id)
+    assert updated is not None
+    assert updated.title == "Manual name"
+    assert updated.auto_title is None
+    assert len(provider.calls) == 8
+    assert not any("conversation" in call[2][0].content for call in provider.calls)
+
+
+@pytest.mark.anyio
+async def test_session_auto_name_regen_failure_keeps_title_and_marks_stage(
+    tmp_path: Path,
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
+    record = manager.create_session(cwd=tmp_path, model="fake")
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Fix broken CLI output")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 1")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 2")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 3")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 4")),
+            ],
+            # Regeneration at prompt 5 fails.
+            [assistant_error(message="regen failed")],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 5")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 6")),
+            ],
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            session_id=record.id,
+            session_manager=manager,
+        )
+    )
+
+    await _drive_prompts(
+        session,
+        "Fix the broken CLI output.",
+        "Add a parser module.",
+        "Wire the unit tests.",
+        "Update the README docs.",
+        "Handle timeout errors.",
+        "Refactor the internals.",
+    )
+
+    updated = manager.get_session(record.id)
+    assert updated is not None
+    assert updated.title == "Fix broken CLI output"
+    assert updated.auto_name_stage == 1
+    # 1 initial naming + 4 agent runs + 1 failed regen + 2 agent runs.
+    assert len(provider.calls) == 8
+    # The failed stage was marked attempted: prompt 6 added no naming request.
+    assert [call[2][0].content for call in provider.calls if call[3] == []] == [
+        provider.calls[0][2][0].content,
+        provider.calls[5][2][0].content,
+    ]
+
+
+@pytest.mark.anyio
+async def test_session_auto_name_regen_resumes_from_disk(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
+    record = manager.create_session(cwd=tmp_path, model="fake")
+
+    async def load_with(provider: FakeProvider) -> CodingSession:
+        return await CodingSession.load(
+            CodingSessionConfig(
+                provider=provider,
+                model="fake",
+                system="You are Tau.",
+                storage=storage,
+                cwd=tmp_path,
+                session_id=record.id,
+                session_manager=manager,
+            )
+        )
+
+    first_provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Initial title")),
+            ],
+        ]
+        + [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content=f"Done {index}")),
+            ]
+            for index in range(1, 5)
+        ]
+    )
+    session = await load_with(first_provider)
+    await _drive_prompts(session, "P1.", "P2.", "P3.", "P4.")
+
+    resumed_provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Fifth title")),
+            ],
+        ]
+        + [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content=f"Done {index}")),
+            ]
+            for index in range(5, 10)
+        ]
+        + [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Tenth done")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 10")),
+            ],
+        ]
+    )
+    session = await load_with(resumed_provider)
+    await _drive_prompts(session, "P5.", "P6.", "P7.", "P8.", "P9.", "P10.")
+
+    updated = manager.get_session(record.id)
+    assert updated is not None
+    assert updated.title == "Tenth done"
+    assert updated.auto_name_stage == 2
+    assert len(resumed_provider.calls) == 8
+    assert len([call for call in resumed_provider.calls if call[3] == []]) == 2
+
+
 @pytest.mark.anyio
 async def test_session_loads_and_expands_skills(tmp_path: Path) -> None:
     resource_root = tmp_path / "resources"
