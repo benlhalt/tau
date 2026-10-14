@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ssl
 import string
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import suppress
@@ -10,9 +11,17 @@ from dataclasses import dataclass, field, replace
 from os import environ
 from pathlib import Path
 from typing import Literal
+from uuid import uuid4
+
+import httpx
 
 from tau_agent.events import AgentEndEvent, AgentEvent, MessageEndEvent, ToolExecutionEndEvent
-from tau_agent.harness import AgentHarness, AgentHarnessConfig, QueuedMessages
+from tau_agent.harness import (
+    AgentHarness,
+    AgentHarnessConfig,
+    QueuedMessages,
+    SimpleCancellationToken,
+)
 from tau_agent.messages import (
     AgentMessage,
     AssistantMessage,
@@ -46,6 +55,7 @@ from tau_agent.tools import AgentTool
 from tau_agent.types import JSONValue
 from tau_ai.model_catalog import ModelCatalogProvider, RuntimeModel, RuntimeModelCatalog
 from tau_ai.model_limits import ModelLimitsProvider, RuntimeModelLimits
+from tau_ai.retry import wait_for_retry
 from tau_coding.branch_summary import summarize_branch_messages_with_model
 from tau_coding.codex_model_store import (
     cached_codex_model_catalog,
@@ -174,6 +184,8 @@ SESSION_NAME_SYSTEM_PROMPT = (
     "You write concise coding-agent session names. Reply with only a short title, "
     "maximum four words, no quotes, no punctuation-only output."
 )
+_AUTO_NAME_REGEN_PROMPT_COUNTS: tuple[int, ...] = (5, 10)
+
 TREE_RUNNING_MESSAGE = "Tau is still working. Press Escape to interrupt before using /tree."
 
 
@@ -503,6 +515,10 @@ class CodingSession:
         self._persisted_message_ids: set[int] = set()
         self._ended_message_ids: set[int] = set()
         self._pending_message_writes: dict[int, _PendingMessageWrite] = {}
+        # Cancellable token for transient-error retry backoff between runs. The
+        # harness's token only exists while a run is active, so escape/backoff
+        # needs its own token that CodingSession.cancel() cancels too.
+        self._retry_interrupt = SimpleCancellationToken()
         self._attach_persistence_listener()
 
     @classmethod
@@ -1544,6 +1560,7 @@ class CodingSession:
     def cancel(self) -> None:
         """Cancel the currently running agent turn, if any."""
         self._harness.cancel()
+        self._retry_interrupt.cancel()
 
     def queue_update_event(self) -> QueueUpdateEvent:
         """Return the current queue state as a coding-session event."""
@@ -2327,6 +2344,106 @@ class CodingSession:
         await self._extension_runtime.emit_event(retry_end)
         yield retry_end
 
+    async def _run_transient_exception_auto_retry(
+        self,
+        *,
+        context: AgentCallDiagnosticContext,
+        exc: BaseException,
+        phase: str,
+    ) -> AsyncIterator[CodingSessionEvent]:
+        """Auto-retry one escaped transient transport failure like a "continue".
+
+        A transport exception (SSL drop, connection reset, timeout) escaping the
+        provider stream commits nothing to the transcript — ``run_agent_loop``
+        appends an assistant message only after its stream completes — so
+        re-running the harness loop re-prompts exactly the clean context a human
+        "continue" would use, over a fresh connection.
+
+        Retrying is bounded (``_TRANSIENT_RETRY_MAX_ATTEMPTS`` total requests)
+        and cancellable during backoff. Non-transient exceptions are re-raised
+        immediately through the caller's unchanged log-and-raise behavior keep
+        ``kind == "exception"`` meaning "the run died". A cancelled backoff
+        ends the cycle gracefully (no re-raise).
+        """
+        if not _is_transient_transport_exception(exc):
+            self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
+                context=context,
+                phase=phase,
+                exc=exc,
+            )
+            raise exc
+
+        max_attempts = _TRANSIENT_RETRY_MAX_ATTEMPTS
+        attempts_used = 0
+        current_exc = exc
+        seen_errors: list[tuple[str, str]] = [(_exception_class_name(exc), str(exc))]
+        cancelled = False
+        success = False
+        while attempts_used < max_attempts - 1:
+            attempts_used += 1
+            delay_ms = _transient_retry_delay_ms(attempts_used)
+            retry_start = AutoRetryStartEvent(
+                attempt=attempts_used,
+                max_attempts=max_attempts,
+                delay_ms=delay_ms,
+                error_message=str(current_exc),
+            )
+            await self._extension_runtime.emit_event(retry_start)
+            yield retry_start
+            if not await wait_for_retry(delay_ms / 1000, signal=self._retry_interrupt):
+                cancelled = True
+                break
+            retry_events = self._harness.continue_()
+            self._invalidate_context_usage_cache()
+            try:
+                async for retry_event in retry_events:
+                    if isinstance(retry_event, ToolExecutionEndEvent):
+                        self._invalidate_context_usage_cache()
+                    if isinstance(retry_event, AgentEndEvent):
+                        yield SessionAgentEndEvent(
+                            messages=retry_event.messages,
+                            will_retry=False,
+                        )
+                    else:
+                        yield retry_event
+                success = True
+                break
+            except Exception as nested_exc:
+                aclose = getattr(retry_events, "aclose", None)
+                if aclose is not None:
+                    with suppress(Exception):
+                        await aclose()
+                current_exc = nested_exc
+                seen_errors.append((_exception_class_name(nested_exc), str(nested_exc)))
+                if not _is_transient_transport_exception(nested_exc):
+                    break
+        final_error = (
+            None
+            if success
+            else ("Cancelled during retry backoff" if cancelled else str(current_exc))
+        )
+        retry_end = AutoRetryEndEvent(
+            success=success,
+            attempt=attempts_used,
+            final_error=final_error,
+        )
+        await self._extension_runtime.emit_event(retry_end)
+        yield retry_end
+        self._last_diagnostic_log_path = self._diagnostic_logger.log_transient_auto_retry(
+            context=context,
+            success=success,
+            attempts=attempts_used,
+            max_attempts=max_attempts,
+            errors=seen_errors,
+        )
+        if not success and not cancelled:
+            self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
+                context=context,
+                phase=phase,
+                exc=current_exc,
+            )
+            raise current_exc
+
     def _build_runtime_provider(
         self,
         *,
@@ -2876,12 +2993,18 @@ class CodingSession:
         return f"Resumed session: {record.id}"
 
     async def set_session_name(self, name: str) -> str:
-        """Persist a session name and notify extensions after it changes."""
+        """Persist a session name and notify extensions after it changes.
+
+        A manual rename clears the auto-generated title provenance, which
+        permanently disables future automatic regeneration for this session.
+        """
         normalized = normalize_session_name(name)
         persisted = self._persist_session_name(
             normalized,
             only_if_unnamed=False,
+            only_if_auto=False,
             index_if_missing=True,
+            provenance="manual",
         )
         if persisted is None:
             return normalized
@@ -2894,8 +3017,18 @@ class CodingSession:
         *,
         only_if_unnamed: bool,
         index_if_missing: bool,
+        only_if_auto: bool = False,
+        provenance: Literal["auto", "manual"] | None = None,
+        regen_stage: int | None = None,
     ) -> str | None:
-        """Persist and return a changed name; return None for a no-op."""
+        """Persist and return a changed name; return None for a no-op.
+
+        ``only_if_auto`` no-ops when the record's title was not produced by an
+        auto-naming run (closing the race where a manual rename lands while a
+        regeneration request is in flight). ``provenance`` records whether the
+        title is auto-generated (``auto``) or user-owned (``manual``) on the
+        index record; ``manual`` clears auto provenance for good.
+        """
         normalized = normalize_session_name(name)
         manager = self._config.session_manager
         session_id = self._config.session_id
@@ -2909,13 +3042,26 @@ class CodingSession:
             return None
         if only_if_unnamed and record.title:
             return None
+        if only_if_auto and (record.auto_title is None or record.title != record.auto_title):
+            return None
         if record.title == normalized:
             return None
+        if provenance == "auto":
+            auto_title = normalized
+            auto_name_stage = regen_stage if regen_stage else record.auto_name_stage
+        elif provenance == "manual":
+            auto_title = None
+            auto_name_stage = record.auto_name_stage
+        else:
+            auto_title = record.auto_title
+            auto_name_stage = record.auto_name_stage
         updated = manager.touch_session(
             session_id,
             model=self.model,
             provider_name=self.provider_name,
             title=normalized,
+            auto_title=auto_title,
+            auto_name_stage=auto_name_stage,
         )
         if updated is None:
             if index_if_missing:
@@ -3348,9 +3494,11 @@ class CodingSession:
         # id() values can be reused once earlier message objects are freed.
         self._ended_message_ids.clear()
         self._persisted_message_ids.clear()
+        # A new user run starts with a fresh cancellation token so a prior
+        # cancel cannot abort this run's transient-error retry backoff.
+        self._retry_interrupt = SimpleCancellationToken()
         events: AsyncIterator[AgentEvent] | None = None
         settled_event: AgentSettledEvent | None = None
-        auto_name_attempted = False
         overflow_message: AssistantMessage | None = None
         route_failure_message: AssistantMessage | None = None
         try:
@@ -3368,12 +3516,7 @@ class CodingSession:
             self._invalidate_context_usage_cache()
             async for event in events:
                 auto_name_message: str | None = None
-                if (
-                    isinstance(event, MessageEndEvent)
-                    and not auto_name_attempted
-                    and isinstance(event.message, UserMessage)
-                ):
-                    auto_name_attempted = True
+                if isinstance(event, MessageEndEvent) and isinstance(event.message, UserMessage):
                     auto_name_message = event.message.text
                 if isinstance(event, ToolExecutionEndEvent):
                     self._invalidate_context_usage_cache()
@@ -3469,12 +3612,12 @@ class CodingSession:
             else:
                 await self._try_auto_compact(context=context, phase="auto_compact_after_prompt")
         except Exception as exc:
-            self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
+            async for auto_retry_event in self._run_transient_exception_auto_retry(
                 context=context,
-                phase="agent_loop",
                 exc=exc,
-            )
-            raise
+                phase="agent_loop",
+            ):
+                yield auto_retry_event
         finally:
             try:
                 await self._reconcile_run_persistence(events, context=context)
@@ -3492,6 +3635,9 @@ class CodingSession:
         # id() values can be reused once earlier message objects are freed.
         self._ended_message_ids.clear()
         self._persisted_message_ids.clear()
+        # A new user run starts with a fresh cancellation token so a prior
+        # cancel cannot abort this run's transient-error retry backoff.
+        self._retry_interrupt = SimpleCancellationToken()
         events: AsyncIterator[AgentEvent] | None = None
         settled_event: AgentSettledEvent | None = None
         route_failure_message: AssistantMessage | None = None
@@ -3525,12 +3671,12 @@ class CodingSession:
                     yield failover_event
             await self._try_auto_compact(context=context, phase="auto_compact_after_continue")
         except Exception as exc:
-            self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
+            async for auto_retry_event in self._run_transient_exception_auto_retry(
                 context=context,
-                phase="agent_loop",
                 exc=exc,
-            )
-            raise
+                phase="agent_loop",
+            ):
+                yield auto_retry_event
         finally:
             try:
                 await self._reconcile_run_persistence(events, context=context)
@@ -3900,47 +4046,130 @@ class CodingSession:
 
     async def _try_auto_name_session(
         self,
-        first_message: str,
+        latest_user_message: str,
         *,
         context: AgentCallDiagnosticContext,
     ) -> None:
-        if not self._should_auto_name_session():
+        stage = self._auto_name_stage()
+        if stage is None:
             return
+        if stage == 0:
+            source_text = latest_user_message
+            source_kind: Literal["first_message", "conversation"] = "first_message"
+        else:
+            source_text = self._conversation_naming_digest()
+            source_kind = "conversation"
         try:
-            title = await self._generate_session_name(first_message)
+            title = await self._generate_session_name(source_text, source_kind=source_kind)
         except Exception as exc:  # noqa: BLE001 - naming must not interrupt the agent turn
             self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
                 context=context,
                 phase="auto_name_session",
                 exc=exc,
             )
-            title = _fallback_session_name(first_message)
+            title = None
+        if title is None and stage == 0:
+            title = _fallback_session_name(latest_user_message)
         if title is None:
-            title = _fallback_session_name(first_message)
-        if title is None:
+            # A failed regeneration keeps the existing title. Mark the stage
+            # attempted so a broken naming provider cannot levy a doomed
+            # request on every subsequent prompt.
+            if stage > 0:
+                self._mark_auto_name_stage(stage)
             return
         persisted = self._persist_session_name(
             title,
-            only_if_unnamed=True,
+            only_if_unnamed=(stage == 0),
+            only_if_auto=(stage > 0),
             index_if_missing=False,
+            provenance="auto",
+            regen_stage=stage,
         )
         if persisted is not None:
             await self._extension_runtime.emit_event(SessionInfoChangedEvent(name=persisted))
 
-    def _should_auto_name_session(self) -> bool:
-        if self._config.session_id is None or self._config.session_manager is None:
-            return False
-        record = self._config.session_manager.get_session(self._config.session_id)
-        if record is not None and record.title:
-            return False
-        return sum(isinstance(message, UserMessage) for message in self._harness.messages) == 1
+    def _mark_auto_name_stage(self, stage: int) -> None:
+        """Best-effort durable record that a regeneration stage was attempted."""
+        manager = self._config.session_manager
+        session_id = self._config.session_id
+        if manager is None or session_id is None:
+            return
+        with suppress(Exception):
+            manager.touch_session(session_id, auto_name_stage=stage)
 
-    async def _generate_session_name(self, first_message: str) -> str | None:
-        prompt = (
-            "Create a concise session name for this first user message. "
-            "Use at most four words.\n\n"
-            f"User message:\n{first_message}"
+    def _user_prompt_count(self) -> int:
+        """Count durable user prompts on the active branch path.
+
+        Counts from the append-only entries rather than the in-memory context
+        view so it survives compaction (which rewrites only the live context)
+        and is correct for sessions resumed from disk.
+        """
+        return sum(
+            1
+            for entry in self._state.entries
+            if entry.type == "message" and isinstance(entry.message, UserMessage)
         )
+
+    def _auto_name_stage(self) -> int | None:
+        """Resolve the naming stage for the current prompt count.
+
+        ``0`` means initial naming from the first user message (the historical
+        behavior); ``1..N`` mean regeneration stages keyed to
+        ``_AUTO_NAME_REGEN_PROMPT_COUNTS``; ``None`` means do not name now.
+        Regeneration only applies to titles Tau produced itself: a manual
+        rename (``auto_title`` cleared) permanently opts the session out.
+        """
+        manager = self._config.session_manager
+        session_id = self._config.session_id
+        if manager is None or session_id is None:
+            return None
+        record = manager.get_session(session_id)
+        count = self._user_prompt_count()
+        if count == 1 and (record is None or not record.title):
+            return 0
+        if record is None or not record.title:
+            return None
+        if record.auto_title is None or record.title != record.auto_title:
+            return None
+        for stage, threshold in enumerate(_AUTO_NAME_REGEN_PROMPT_COUNTS, start=1):
+            if count >= threshold and record.auto_name_stage < stage:
+                return stage
+        return None
+
+    def _affinity_session_id(self) -> str:
+        """Stable per-session id for provider affinity headers.
+
+        OpenCode Go (tau commit 7868ec7) sends ``x-opencode-session`` and
+        rejects requests that omit it; naming/compaction requests must carry a
+        session id too. Sessions without a record id (in-memory children,
+        e.g. spawned by the tau-subagents extension) get a stable fallback id
+        instead of None so the header is always emitted.
+        """
+        if self._config.session_id is not None:
+            return self._config.session_id
+        fallback = getattr(self, "_affinity_session_fallback_id", None)
+        if fallback is None:
+            fallback = self._affinity_session_fallback_id = f"mem-{uuid4().hex}"
+        return fallback
+
+    async def _generate_session_name(
+        self,
+        source_text: str,
+        *,
+        source_kind: Literal["first_message", "conversation"],
+    ) -> str | None:
+        if source_kind == "first_message":
+            prompt = (
+                "Create a concise session name for this first user message. "
+                "Use at most four words.\n\n"
+                f"User message:\n{source_text}"
+            )
+        else:
+            prompt = (
+                "Create a concise session name for this conversation. "
+                "Use at most four words.\n\n"
+                f"Conversation so far:\n{source_text}"
+            )
         text_parts: list[str] = []
         final_text: str | None = None
         async for event in self._harness.config.provider.stream_response(
@@ -3948,6 +4177,7 @@ class CodingSession:
             system=SESSION_NAME_SYSTEM_PROMPT,
             messages=[UserMessage(content=prompt)],
             tools=[],
+            session_id=self._affinity_session_id(),
         ):
             if isinstance(event, TextDeltaEvent):
                 text_parts.append(event.delta)
@@ -3958,6 +4188,28 @@ class CodingSession:
                     f"Session naming failed: {event.error.error_message or event.reason}"
                 )
         return _sanitize_session_name(final_text if final_text is not None else "".join(text_parts))
+
+    def _conversation_naming_digest(self, *, max_chars: int = 6000) -> str:
+        """Build a compact role-labeled digest of the live conversation.
+
+        Uses the post-compaction in-memory context so a compacted session
+        names itself from the summary plus recent turns.
+        """
+        lines: list[str] = []
+        for message in self._harness.messages:
+            if isinstance(message, UserMessage):
+                role, text = "User", message.text
+            elif isinstance(message, AssistantMessage):
+                role, text = "Assistant", message.text
+            else:
+                continue
+            text = " ".join(text.split())
+            if text:
+                lines.append(f"{role}: {text}")
+        digest = "\n".join(lines)
+        if len(digest) <= max_chars:
+            return digest
+        return "…\n" + digest[-max_chars:]
 
     def _provider_is_usable(self, provider: ProviderConfig) -> bool:
         return provider_has_usable_credentials(
@@ -4018,6 +4270,7 @@ class CodingSession:
             system=SUMMARIZATION_SYSTEM_PROMPT,
             messages=summary_messages,
             tools=[],
+            session_id=self._affinity_session_id(),
         ):
             if isinstance(event, TextDeltaEvent):
                 text_parts.append(event.delta)
@@ -4210,6 +4463,45 @@ def is_retryable_huggingface_route_error(message: AssistantMessage) -> bool:
         if isinstance(status_code, int) and not isinstance(status_code, bool):
             return status_code in {408, 409, 425, 429} or status_code >= 500
     return False
+
+
+# Transient-exception auto-retry: total request attempts (the failed request
+# plus two retries) and capped exponential backoff in milliseconds. The backoff
+# is longer than the adapter-level ~1s window so a slow transient blip (e.g. an
+# SSL drop that a human "continue" clears) can recover before the turn dies.
+_TRANSIENT_RETRY_MAX_ATTEMPTS = 3
+_TRANSIENT_RETRY_BASE_DELAY_MS = 2_000
+_TRANSIENT_RETRY_MAX_DELAY_MS = 16_000
+
+
+def _transient_retry_delay_ms(attempt: int) -> int:
+    """Return capped exponential backoff in milliseconds for one retry."""
+    return int(
+        min(_TRANSIENT_RETRY_MAX_DELAY_MS, _TRANSIENT_RETRY_BASE_DELAY_MS * (2 ** (attempt - 1)))
+    )
+
+
+def _exception_class_name(exc: BaseException) -> str:
+    """Return a stable, JSON-safe exception type name."""
+    return f"{type(exc).__module__}.{type(exc).__name__}"
+
+
+def _is_transient_transport_exception(exc: BaseException) -> bool:
+    """Return whether an escaped exception is a transient transport failure.
+
+    Order matters: ``SSLCertVerificationError`` is a persistent trust problem
+    and subclasses ``SSLError``, so it must be excluded before the SSLError
+    branch. ``SSLEOFError`` subclasses ``SSLError``; ``socket.timeout`` is an
+    alias of ``TimeoutError``; httpx transport errors can leak from streaming
+    reads in some versions and are transient by the same rule.
+    """
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return False
+    if isinstance(exc, ssl.SSLError):
+        return True
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
+    return bool(isinstance(exc, httpx.TransportError))
 
 
 def _session_entry_for_message(

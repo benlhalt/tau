@@ -430,6 +430,9 @@ def _apply_session_affinity_headers(
 ) -> None:
     if session_id is None or affinity_format is None:
         return
+    if affinity_format == "opencode":
+        headers["x-opencode-session"] = session_id
+        return
     if affinity_format == "openrouter":
         headers["x-session-id"] = session_id
         return

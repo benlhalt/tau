@@ -1,7 +1,8 @@
 import asyncio
 import json
+import ssl
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from io import BytesIO
 from pathlib import Path
 
@@ -3057,6 +3058,379 @@ async def test_session_auto_name_does_not_index_new_session_before_first_persist
     assert await storage.read_all() == []
 
 
+async def _drive_prompts(session: CodingSession, *messages: str) -> None:
+    for message in messages:
+        await _collect_session_events(session.prompt(message))
+
+
+@pytest.mark.anyio
+async def test_session_auto_name_regenerates_after_fifth_prompt(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
+    record = manager.create_session(cwd=tmp_path, model="fake")
+    provider = FakeProvider(
+        [
+            # Prompt 1: auto-name then agent.
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Fix broken CLI output")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 1")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 2")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 3")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 4")),
+            ],
+            # Prompt 5: regeneration then agent.
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Broken API parser five")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 5")),
+            ],
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            session_id=record.id,
+            session_manager=manager,
+        )
+    )
+
+    await _drive_prompts(
+        session,
+        "Fix the broken CLI output.",
+        "Add a parser module.",
+        "Wire the unit tests.",
+        "Update the README docs.",
+        "Handle timeout errors.",
+    )
+
+    renamed = manager.get_session(record.id)
+    assert renamed is not None
+    assert renamed.title == "Broken API parser five"
+    assert renamed.auto_title == "Broken API parser five"
+    assert renamed.auto_name_stage == 1
+    assert len(provider.calls) == 7
+    # The initial call names from the first message only.
+    assert "first user message" in provider.calls[0][2][0].content
+    # The regeneration call at the 5th prompt names from the conversation digest.
+    regen_prompt = provider.calls[5][2][0].content
+    assert "conversation" in regen_prompt
+    assert "User: Fix the broken CLI output." in regen_prompt
+    assert "User: Update the README docs." in regen_prompt
+
+
+@pytest.mark.anyio
+async def test_session_auto_name_regenerates_after_tenth_prompt(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
+    record = manager.create_session(cwd=tmp_path, model="fake")
+    streams: list[list[object]] = [
+        [
+            assistant_start(model="fake"),
+            assistant_done(message=AssistantMessage(content="Initial title")),
+        ],
+    ]
+    for index in range(1, 5):
+        streams.append(
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content=f"Done {index}")),
+            ]
+        )
+    streams.append(
+        [
+            assistant_start(model="fake"),
+            assistant_done(message=AssistantMessage(content="Fifth title here")),
+        ]
+    )
+    for index in range(5, 10):
+        streams.append(
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content=f"Done {index}")),
+            ]
+        )
+    # A long stage-2 title verifies the 4-word cap still applies to regenerated names.
+    streams.append(
+        [
+            assistant_start(model="fake"),
+            assistant_done(
+                message=AssistantMessage(content="Tenth title beyond the word limit here")
+            ),
+        ]
+    )
+    streams.append(
+        [
+            assistant_start(model="fake"),
+            assistant_done(message=AssistantMessage(content="Done 10")),
+        ]
+    )
+    provider = FakeProvider(streams)
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            session_id=record.id,
+            session_manager=manager,
+        )
+    )
+
+    await _drive_prompts(
+        session,
+        "Prompt one.",
+        "Prompt two.",
+        "Prompt three.",
+        "Prompt four.",
+        "Prompt five.",
+        "Prompt six.",
+        "Prompt seven.",
+        "Prompt eight.",
+        "Prompt nine.",
+        "Prompt ten.",
+    )
+
+    renamed = manager.get_session(record.id)
+    assert renamed is not None
+    assert renamed.title == "Tenth title beyond the"
+    assert renamed.auto_title == "Tenth title beyond the"
+    assert renamed.auto_name_stage == 2
+    assert len(provider.calls) == 13
+    # Exactly three naming requests: prompts 1, 5, and 10.
+    naming_prompts = [call[2][0].content for call in provider.calls if call[3] == []]
+    assert len(naming_prompts) == 3
+
+
+@pytest.mark.anyio
+async def test_session_auto_name_regen_preserves_manual_name(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
+    record = manager.create_session(cwd=tmp_path, model="fake")
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Fix broken CLI output")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 1")),
+            ],
+        ]
+        + [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content=f"Done {index}")),
+            ]
+            for index in range(2, 8)
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            session_id=record.id,
+            session_manager=manager,
+        )
+    )
+
+    await _drive_prompts(session, "Fix the broken CLI output.", "Add a parser module.")
+    assert manager.get_session(record.id) is not None
+    assert manager.get_session(record.id).title == "Fix broken CLI output"
+
+    await session.set_session_name("Manual name")
+
+    # Drive past the 5th prompt: regeneration must stay disabled.
+    await _drive_prompts(
+        session,
+        "Wire the unit tests.",
+        "Update the README docs.",
+        "Handle timeout errors.",
+        "Refactor the internals.",
+        "Bump the version.",
+    )
+
+    updated = manager.get_session(record.id)
+    assert updated is not None
+    assert updated.title == "Manual name"
+    assert updated.auto_title is None
+    assert len(provider.calls) == 8
+    assert not any("conversation" in call[2][0].content for call in provider.calls)
+
+
+@pytest.mark.anyio
+async def test_session_auto_name_regen_failure_keeps_title_and_marks_stage(
+    tmp_path: Path,
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
+    record = manager.create_session(cwd=tmp_path, model="fake")
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Fix broken CLI output")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 1")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 2")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 3")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 4")),
+            ],
+            # Regeneration at prompt 5 fails.
+            [assistant_error(message="regen failed")],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 5")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 6")),
+            ],
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            session_id=record.id,
+            session_manager=manager,
+        )
+    )
+
+    await _drive_prompts(
+        session,
+        "Fix the broken CLI output.",
+        "Add a parser module.",
+        "Wire the unit tests.",
+        "Update the README docs.",
+        "Handle timeout errors.",
+        "Refactor the internals.",
+    )
+
+    updated = manager.get_session(record.id)
+    assert updated is not None
+    assert updated.title == "Fix broken CLI output"
+    assert updated.auto_name_stage == 1
+    # 1 initial naming + 4 agent runs + 1 failed regen + 2 agent runs.
+    assert len(provider.calls) == 8
+    # The failed stage was marked attempted: prompt 6 added no naming request.
+    assert [call[2][0].content for call in provider.calls if call[3] == []] == [
+        provider.calls[0][2][0].content,
+        provider.calls[5][2][0].content,
+    ]
+
+
+@pytest.mark.anyio
+async def test_session_auto_name_regen_resumes_from_disk(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
+    record = manager.create_session(cwd=tmp_path, model="fake")
+
+    async def load_with(provider: FakeProvider) -> CodingSession:
+        return await CodingSession.load(
+            CodingSessionConfig(
+                provider=provider,
+                model="fake",
+                system="You are Tau.",
+                storage=storage,
+                cwd=tmp_path,
+                session_id=record.id,
+                session_manager=manager,
+            )
+        )
+
+    first_provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Initial title")),
+            ],
+        ]
+        + [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content=f"Done {index}")),
+            ]
+            for index in range(1, 5)
+        ]
+    )
+    session = await load_with(first_provider)
+    await _drive_prompts(session, "P1.", "P2.", "P3.", "P4.")
+
+    resumed_provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Fifth title")),
+            ],
+        ]
+        + [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content=f"Done {index}")),
+            ]
+            for index in range(5, 10)
+        ]
+        + [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Tenth done")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done 10")),
+            ],
+        ]
+    )
+    session = await load_with(resumed_provider)
+    await _drive_prompts(session, "P5.", "P6.", "P7.", "P8.", "P9.", "P10.")
+
+    updated = manager.get_session(record.id)
+    assert updated is not None
+    assert updated.title == "Tenth done"
+    assert updated.auto_name_stage == 2
+    assert len(resumed_provider.calls) == 8
+    assert len([call for call in resumed_provider.calls if call[3] == []]) == 2
+
+
 @pytest.mark.anyio
 async def test_session_loads_and_expands_skills(tmp_path: Path) -> None:
     resource_root = tmp_path / "resources"
@@ -4631,6 +5005,218 @@ async def test_session_compacts_and_retries_once_after_context_overflow(
     assert extension_event_types[-2:] == ["auto_retry_end", "agent_settled"]
     assert extension_event_types.count("agent_settled") == 1
     assert sum(isinstance(event, AgentSettledEvent) for event in retry_events) == 1
+
+
+class _TransientRaisingFakeProvider(FakeProvider):
+    """A FakeProvider that raises a scripted exception for its first N calls."""
+
+    def __init__(
+        self,
+        streams: Iterable[Iterable[AssistantMessageEvent]],
+        *,
+        failures: int,
+        exc: BaseException,
+    ) -> None:
+        super().__init__(streams)
+        self._failures = failures
+        self._exc = exc
+
+    def stream_response(
+        self,
+        *,
+        model: str,
+        system: str,
+        messages: list[AgentMessage],
+        tools: list[AgentTool],
+        signal: CancellationToken | None = None,
+        session_id: str | None = None,
+    ) -> AsyncIterator[AssistantMessageEvent]:
+        self.calls.append((model, system, list(messages), list(tools)))
+        self.session_ids.append(session_id)
+        if self._failures > 0:
+            self._failures -= 1
+            raise self._exc
+        stream = self._streams.pop(0) if self._streams else []
+
+        async def iterator() -> AsyncIterator[AssistantMessageEvent]:
+            for event in stream:
+                if signal is not None and signal.is_cancelled():
+                    return
+                yield event
+
+        return iterator()
+
+
+@pytest.mark.anyio
+async def test_transient_ssl_exception_auto_retries_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(coding_session_module, "_TRANSIENT_RETRY_BASE_DELAY_MS", 0)
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = _TransientRaisingFakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Recovered answer")),
+            ]
+        ],
+        failures=1,
+        exc=ssl.SSLError("ssl/tls alert bad record mac"),
+    )
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+
+    events = await _collect_session_events(session.prompt("hello"))
+    event_types = [getattr(event, "type", None) for event in events]
+    assert "auto_retry_start" in event_types
+    retry_end = next(event for event in events if getattr(event, "type", None) == "auto_retry_end")
+    assert retry_end.success is True
+    assert retry_end.final_error is None
+    assert any(
+        getattr(event, "type", None) == "message_end"
+        and getattr(getattr(event, "message", None), "text", None) == "Recovered answer"
+        for event in events
+    )
+    # Exactly one re-run after the failing request, and nothing was committed
+    # between the two attempts: the replay context is identical.
+    assert len(provider.calls) == 2
+    assert provider.calls[0][0] == provider.calls[1][0]
+    assert provider.calls[0][2] == provider.calls[1][2]
+    assert "agent_settled" in event_types
+
+
+@pytest.mark.anyio
+async def test_transient_exception_auto_retry_exhausts_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(coding_session_module, "_TRANSIENT_RETRY_BASE_DELAY_MS", 0)
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = _TransientRaisingFakeProvider(
+        [],
+        failures=10,
+        exc=ssl.SSLError("persistent bad record mac"),
+    )
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+
+    raised: BaseException | None = None
+    collected: list[object] = []
+    try:
+        async for event in session.prompt("hello"):
+            collected.append(event)
+    except ssl.SSLError as exc:
+        raised = exc
+    assert isinstance(raised, ssl.SSLError)
+    event_types = [getattr(event, "type", None) for event in collected]
+    # The failed request plus exactly two auto-retries before giving up.
+    assert event_types.count("auto_retry_start") == 2
+    retry_end = next(
+        event for event in collected if getattr(event, "type", None) == "auto_retry_end"
+    )
+    assert retry_end.success is False
+    assert "bad record" in (retry_end.final_error or "")
+    assert len(provider.calls) == 3
+
+
+@pytest.mark.anyio
+async def test_transient_exception_auto_retry_skips_non_transport_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(coding_session_module, "_TRANSIENT_RETRY_BASE_DELAY_MS", 0)
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = _TransientRaisingFakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Unused")),
+            ]
+        ],
+        failures=1,
+        exc=ValueError("boom"),
+    )
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+
+    raised: BaseException | None = None
+    collected: list[object] = []
+    try:
+        async for event in session.prompt("hello"):
+            collected.append(event)
+    except ValueError as exc:
+        raised = exc
+    assert isinstance(raised, ValueError)
+    assert not any(getattr(event, "type", None) == "auto_retry_start" for event in collected)
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.anyio
+async def test_transient_exception_auto_retry_skips_cert_verification(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(coding_session_module, "_TRANSIENT_RETRY_BASE_DELAY_MS", 0)
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = _TransientRaisingFakeProvider(
+        [],
+        failures=1,
+        exc=ssl.SSLCertVerificationError("certificate verify failed: self-signed"),
+    )
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+
+    raised: BaseException | None = None
+    collected: list[object] = []
+    try:
+        async for event in session.prompt("hello"):
+            collected.append(event)
+    except ssl.SSLCertVerificationError as exc:
+        raised = exc
+    assert isinstance(raised, ssl.SSLCertVerificationError)
+    assert not any(getattr(event, "type", None) == "auto_retry_start" for event in collected)
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.anyio
+async def test_transient_exception_auto_retry_aborts_on_cancel_during_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(coding_session_module, "_TRANSIENT_RETRY_BASE_DELAY_MS", 500)
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = _TransientRaisingFakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Recovered answer")),
+            ]
+        ],
+        failures=1,
+        exc=ssl.SSLError("ssl/tls alert bad record mac"),
+    )
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+
+    agen = session.prompt("hello")
+    collected: list[object] = []
+    async for event in agen:
+        collected.append(event)
+        if getattr(event, "type", None) == "auto_retry_start":
+            break
+    session.cancel()
+    collected.extend([event async for event in agen])  # type: ignore[attr-defined]
+
+    event_types = [getattr(event, "type", None) for event in collected]
+    retry_end = next(
+        event for event in collected if getattr(event, "type", None) == "auto_retry_end"
+    )
+    assert retry_end.success is False
+    assert retry_end.final_error == "Cancelled during retry backoff"
+    # Cancelling during backoff must not fire the retried request.
+    assert len(provider.calls) == 1
+    assert "agent_settled" in event_types
+    assert not any(
+        getattr(event, "type", None) == "message_end"
+        and getattr(getattr(event, "message", None), "text", None) == "Recovered answer"
+        for event in collected
+    )
 
 
 @pytest.mark.anyio

@@ -93,6 +93,39 @@ class AgentCallDiagnosticLogger:
         self._append(entry)
         return self.path
 
+    def log_transient_auto_retry(
+        self,
+        *,
+        context: AgentCallDiagnosticContext,
+        success: bool,
+        attempts: int,
+        max_attempts: int,
+        errors: list[tuple[str, str]],
+    ) -> Path:
+        """Log one transient-exception auto-retry cycle with per-attempt detail.
+
+        Uses its own kind (not "exception") so the invariant that
+        ``kind == "exception"`` means the run died and surfaced a user-visible
+        failure stays meaningful for log mining ("exception" entries are how
+        live provider failures are spotted today).
+        """
+        entry = _base_entry(
+            context,
+            phase="agent_loop_transient_retry",
+            kind="transient_auto_retry",
+        )
+        entry["transient_auto_retry"] = {
+            "success": success,
+            "attempts": attempts,
+            "max_attempts": max_attempts,
+            "errors": [
+                {"type": error_type, "message": error_message}
+                for error_type, error_message in errors
+            ],
+        }
+        self._append(entry)
+        return self.path
+
     def _append(self, entry: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as file:

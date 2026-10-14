@@ -1580,6 +1580,7 @@ def _detected_compat(provider: ProviderConfig, model: str) -> dict[str, Any]:
     is_deepseek = provider.name == "deepseek" or "deepseek.com" in base_url
     is_cerebras = provider.name == "cerebras" or "cerebras.ai" in base_url
     is_openrouter = provider.name == "openrouter" or "openrouter.ai" in base_url
+    is_opencode = provider.name in {"opencode", "opencode-go"} or "opencode.ai" in base_url
     is_openai_api = (
         urlsplit(base_url).hostname == urlsplit(DEFAULT_OPENAI_COMPATIBLE_BASE_URL).hostname
     )
@@ -1609,8 +1610,12 @@ def _detected_compat(provider: ProviderConfig, model: str) -> dict[str, Any]:
         # accepted by compatible gateways. Default them on only for the official
         # endpoint; provider/model compat can opt another route in explicitly.
         "supportsPromptCacheKey": is_openai_api,
-        "sendSessionAffinityHeaders": is_openai_api and is_openai_responses,
-        "sessionAffinityFormat": "openrouter" if is_openrouter else "openai",
+        # OpenCode Go rejects requests that omit x-opencode-session, its
+        # per-conversation routing header, so its routes always opt in.
+        "sendSessionAffinityHeaders": is_opencode or (is_openai_api and is_openai_responses),
+        "sessionAffinityFormat": (
+            "opencode" if is_opencode else "openrouter" if is_openrouter else "openai"
+        ),
         # Only first-party Anthropic is known to accept cache_control. Several
         # catalog providers speak the Anthropic protocol through a gateway, and one
         # proxies to non-Anthropic models, so they default to no breakpoints. This
